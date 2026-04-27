@@ -39,7 +39,6 @@ uv run vision --presets
 | `ollama` | Local Ollama | llava |
 | `lmstudio` | Local LM Studio | auto |
 | `openrouter` | OpenRouter | GPT-4o |
-| `deepseek` | DeepSeek API | deepseek-chat |
 
 ## Supported Formats
 

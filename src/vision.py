@@ -57,12 +57,6 @@ PRESETS = {
         "key_env": "OPENROUTER_API_KEY",
         "desc": "OpenRouter (multi-provider gateway)",
     },
-    "deepseek": {
-        "base_url": "https://api.deepseek.com/v1/chat/completions",
-        "model": "deepseek-chat",
-        "key_env": "DEEPSEEK_API_KEY",
-        "desc": "DeepSeek API (text-only; no vision)",
-    },
 }
 
 DEFAULT_PRESET = "nvidia"
