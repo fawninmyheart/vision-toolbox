@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
-r"""Universal file analyzer — images, PDFs, Office docs, code, and more.
+r"""Universal file analyzer — images, PDFs, videos, Office docs, code, and more.
 
-Sends files to NVIDIA's free multimodal API for analysis. Handles every common
-format by converting it to text or images that the VLM can understand.
+Sends files to any OpenAI-compatible multimodal API for analysis.
 
 Usage:
-  vision.py image.jpg                    # Analyze an image
-  vision.py document.pdf                 # PDF (auto-rendered as images)
-  vision.py report.docx                  # Office doc (auto-extracted text)
-  vision.py data.csv notes.txt           # Mix text files
-  vision.py screenshot.png --prompt ...  # Custom prompt
-  vision.py --list-models                # Show available models
+  vision.py image.jpg                              # NVIDIA free API (default)
+  vision.py image.jpg --provider openai            # OpenAI
+  vision.py image.jpg --provider ollama --model llama3.2-vision  # Local
+  vision.py image.jpg --base-url http://x:8080/v1/chat/completions  # Custom
+  vision.py --presets                              # List available presets
 
-Setup:
-  export NVIDIA_API_KEY=nvapi-...
-  Get free key at https://build.nvidia.com
+Env vars: NVIDIA_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or API_KEY
 """
 
 import argparse, base64, io, json, mimetypes, os, sys, tempfile, subprocess
@@ -22,9 +18,55 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-DEFAULT_MODEL = "moonshotai/kimi-k2.5"
-MAX_TEXT_CHARS = 80000  # truncate huge text files
+# ── provider presets ─────────────────────────────────────────────────
+
+PRESETS = {
+    "nvidia": {
+        "base_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "model": "moonshotai/kimi-k2.5",
+        "key_env": "NVIDIA_API_KEY",
+        "desc": "NVIDIA NIM free tier (Kimi K2.5, Qwen3.5 VL, Llama Vision…)",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1/chat/completions",
+        "model": "gpt-4o",
+        "key_env": "OPENAI_API_KEY",
+        "desc": "OpenAI (GPT-4o, GPT-4.1…)",
+    },
+    "anthropic": {
+        "base_url": "https://api.anthropic.com/v1/messages",
+        "model": "claude-sonnet-4-6",
+        "key_env": "ANTHROPIC_API_KEY",
+        "desc": "Anthropic (not OpenAI-compatible; use a proxy)",
+    },
+    "ollama": {
+        "base_url": "http://localhost:11434/v1/chat/completions",
+        "model": "llava:latest",
+        "key_env": None,
+        "desc": "Local Ollama (llava, llama3.2-vision, minicpm-v…)",
+    },
+    "lmstudio": {
+        "base_url": "http://localhost:1234/v1/chat/completions",
+        "model": "auto",
+        "key_env": None,
+        "desc": "Local LM Studio",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1/chat/completions",
+        "model": "openai/gpt-4o",
+        "key_env": "OPENROUTER_API_KEY",
+        "desc": "OpenRouter (multi-provider gateway)",
+    },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/v1/chat/completions",
+        "model": "deepseek-chat",
+        "key_env": "DEEPSEEK_API_KEY",
+        "desc": "DeepSeek API (text-only; no vision)",
+    },
+}
+
+DEFAULT_PRESET = "nvidia"
+MAX_TEXT_CHARS = 80000
 PDF_MAX_PAGES = 5
 PDF_DPI = 150
 
@@ -212,7 +254,7 @@ def build_message(prompt: str, items: list[dict]) -> dict:
     return {"role": "user", "content": content}
 
 
-def call_api(api_key: str, model: str, messages: list[dict],
+def call_api(api_key: str, base_url: str, model: str, messages: list[dict],
              max_tokens: int = 4096) -> dict:
     body = json.dumps({
         "model": model,
@@ -221,7 +263,7 @@ def call_api(api_key: str, model: str, messages: list[dict],
         "temperature": 0.2,
     }).encode()
 
-    req = Request(BASE_URL, data=body, headers={
+    req = Request(base_url, data=body, headers={
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     })
@@ -238,30 +280,42 @@ def call_api(api_key: str, model: str, messages: list[dict],
 # ── main ─────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Universal file analyzer via NVIDIA free API")
+    parser = argparse.ArgumentParser(description="Universal file analyzer via any OpenAI-compatible API")
     parser.add_argument("files", nargs="*", help="File paths to analyze")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Custom prompt")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model ID")
-    parser.add_argument("--key", default=os.environ.get("NVIDIA_API_KEY"),
-                        help="NVIDIA API key (env: NVIDIA_API_KEY)")
+    parser.add_argument("--provider", default=DEFAULT_PRESET,
+                        help=f"Provider preset (default: {DEFAULT_PRESET})")
+    parser.add_argument("--base-url", help="Override API base URL")
+    parser.add_argument("--model", help="Override model ID")
+    parser.add_argument("--key", default=os.environ.get("API_KEY"),
+                        help="API key (env: API_KEY, or provider-specific)")
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--list-models", action="store_true")
+    parser.add_argument("--presets", action="store_true", help="List provider presets")
     args = parser.parse_args()
 
-    if args.list_models:
-        for mid, desc in [
-            ("moonshotai/kimi-k2.5", "Kimi K2.5 1T MoE — best multimodal"),
-            ("qwen/qwen3.5-397b-a17b", "Qwen3.5 VL 400B — 256K ctx, 200+ langs"),
-            ("meta/llama-3.2-90b-vision-instruct", "Llama 3.2 90B Vision"),
-            ("mistralai/mistral-small-3.2-24b-instruct", "Mistral Small 3.2 24B — fast"),
-            ("nvidia/cosmos-reason2", "Cosmos Reason2 — visual reasoning"),
-        ]:
-            print(f"  {mid}\n    {desc}\n")
+    if args.presets:
+        print("Available presets (--provider):\n")
+        for name, cfg in PRESETS.items():
+            marker = " [default]" if name == DEFAULT_PRESET else ""
+            print(f"  {name}{marker}")
+            print(f"    {cfg['desc']}")
+            print(f"    model: {cfg['model']}")
+            if cfg["key_env"]:
+                print(f"    key:   ${cfg['key_env']}")
+            print()
         return
 
-    if not args.key:
-        print("ERROR: Set NVIDIA_API_KEY or pass --key", file=sys.stderr)
-        print("Get free key: https://build.nvidia.com", file=sys.stderr)
+    # Resolve provider
+    preset = PRESETS.get(args.provider, PRESETS[DEFAULT_PRESET])
+    base_url = args.base_url or preset["base_url"]
+    model = args.model or preset["model"]
+    api_key = args.key
+    if not api_key and preset["key_env"]:
+        api_key = os.environ.get(preset["key_env"])
+
+    if not api_key:
+        key_hint = preset["key_env"] or "API_KEY"
+        print(f"ERROR: No API key. Set ${key_hint} or pass --key", file=sys.stderr)
         sys.exit(1)
 
     if not args.files:
@@ -322,7 +376,7 @@ def main():
     messages = [build_message(full_prompt, image_items)]
     print(f"[Sending] {' '.join(stats)}", file=sys.stderr)
 
-    result = call_api(args.key, args.model, messages, args.max_tokens)
+    result = call_api(api_key, base_url, model, messages, args.max_tokens)
 
     if "error" in result:
         print(f"API Error: {result['error']}", file=sys.stderr)
